@@ -1,10 +1,12 @@
 import datetime
+import re
 from typing import Any, Optional
 
 import appdaemon.plugins.hass.hassapi as hass
 
 # Constants for relay toggle timeout
 RELAY_TOGGLE_TIMEOUT = 0.5
+
 
 class DoorController(hass.Hass):
     """
@@ -23,16 +25,17 @@ class DoorController(hass.Hass):
         """
         self.log("Initializing Door Controller App")
         self.friendly_name = self.args.get("friendly_name", "Door Controller")
-        self.health_status_sensor = self.args.get("health_status_sensor")
+        self.entity_prefix = self._slugify(self.args.get("entity_prefix", self.friendly_name))
+        self.input_button_open = self._build_generated_entity_id("input_button", "open")
+        self.input_button_close = self._build_generated_entity_id("input_button", "close")
+        self.input_button_external = self._build_generated_entity_id(
+            "input_button", "external"
+        )
+        self.door_status_sensor = self._build_generated_entity_id("sensor", "status")
+        self.health_status_sensor = self._build_generated_entity_id("sensor", "health")
 
         required_args = (
-            "friendly_name",
-            "health_status_sensor",
-            "door_switch",
-            "door_status_sensor",
-            "input_button_open",
-            "input_button_close",
-            "external_button",
+            "door_relay",
         )
         missing_args = [key for key in required_args if key not in self.args]
         if missing_args:
@@ -45,12 +48,7 @@ class DoorController(hass.Hass):
                 self.update_health_entity("faulty")
             return
 
-        self.door_switch = self.args["door_switch"]
-        self.door_status_sensor = self.args["door_status_sensor"]
-        self.input_button_open = self.args["input_button_open"]
-        self.input_button_close = self.args["input_button_close"]
-        self.input_button_external = self.args["external_button"]
-        self.input_button_pedestrian = self.args.get("input_button_pedestrian")
+        self.door_relay = self.args["door_relay"]
 
         self.close_sensor = self.args.get("close_sensor")
         self.open_sensor = self.args.get("open_sensor")
@@ -61,17 +59,12 @@ class DoorController(hass.Hass):
             self.args.get("open_sensor_active_state", "off")
         )
         self.timeout = int(self.args.get("timeout", 30))
-        self.pedestrian_open_timeout = int(
-            self.args.get("pedestrian_open_timeout", 10)
-        )
 
         self.has_sensors = bool(self.close_sensor or self.open_sensor)
         self.isSensorless = not self.has_sensors
         self.door_state = "unknown"
         self.last_action_time: Optional[datetime.datetime] = None
-        self.last_command_by_app = False
-        self.target_state: Optional[str] = None
-        self.predict_mov_dir = "open"
+        self.pending_target: Optional[str] = None
         self.diagnostic_handle: Optional[str] = None
 
         if self.close_sensor:
@@ -83,11 +76,7 @@ class DoorController(hass.Hass):
         self.listen_state(self.handle_close_event, self.input_button_close)
         self.listen_state(self.handle_external_button_event, self.input_button_external)
 
-        if self.input_button_pedestrian:
-            self.listen_state(
-                self.handle_pedestrian_event, self.input_button_pedestrian
-            )
-
+        self.create_command_entities()
         self.create_door_status_entity()
         self.create_health_entity()
         self.update_health_entity("healthy")
@@ -96,6 +85,26 @@ class DoorController(hass.Hass):
             self.door_status_changed(None, None, None, None, None)
 
         self.log(f"{self.friendly_name} Initialized")
+
+    def create_command_entities(self) -> None:
+        """
+        Create app-managed command helper entities.
+        """
+        self.set_state(
+            self.input_button_open,
+            state="idle",
+            attributes={"friendly_name": f"{self.friendly_name} Open"},
+        )
+        self.set_state(
+            self.input_button_close,
+            state="idle",
+            attributes={"friendly_name": f"{self.friendly_name} Close"},
+        )
+        self.set_state(
+            self.input_button_external,
+            state="idle",
+            attributes={"friendly_name": f"{self.friendly_name} External"},
+        )
 
     def create_door_status_entity(self) -> None:
         """
@@ -145,8 +154,6 @@ class DoorController(hass.Hass):
         :param new: The new state of the entity.
         :param kwargs: Additional keyword arguments.
         """
-        if self._should_ignore_event(old, new):
-            return
 
         self.log("Opening door (input_button)...")
         self.request_target_state("open")
@@ -163,11 +170,9 @@ class DoorController(hass.Hass):
         :param new: The new state of the entity.
         :param kwargs: Additional keyword arguments.
         """
-        if self._should_ignore_event(old, new):
-            return
 
         self.log("Closing door (input_button)...")
-        self.request_target_state("close")
+        self.request_target_state("closed")
 
     def handle_external_button_event(
         self, entity: str, attribute: str, old: str, new: str, kwargs: dict
@@ -181,55 +186,21 @@ class DoorController(hass.Hass):
         :param new: The new state of the entity.
         :param kwargs: Additional keyword arguments.
         """
-        if self._should_ignore_event(old, new):
-            return
 
-        self.log("External button activated, performing door action.")
-        self.last_command_by_app = True
-        self.target_state = self.predict_mov_dir if self.has_sensors else None
+        self.log("External button activated, pulsing relay.")
+        self.clear_pending_command()
         self.activate_relay()
-
-        if not self.has_sensors:
-            self.last_command_by_app = False
-            return
-
-        if self.target_state == "open":
-            self.predict_mov_dir = "close"
-        elif self.target_state == "close":
-            self.predict_mov_dir = "open"
-
-    def handle_pedestrian_event(
-        self, entity: str, attribute: str, old: str, new: str, kwargs: dict
-    ) -> None:
-        """
-        Handle the input_button to open the door for pedestrian access.
-
-        :param entity: The input_button entity that changed state.
-        :param attribute: The attribute of the entity that changed.
-        :param old: The old state of the entity.
-        :param new: The new state of the entity.
-        :param kwargs: Additional keyword arguments.
-        """
-        if self._should_ignore_event(old, new):
-            return
-
-        self.log("Pedestrian access requested (input_button)...")
-        self.last_command_by_app = False
-        self.target_state = None
-        self.cancel_diagnostics()
-        self.activate_relay()
-        self.run_in(self.activate_relay, self.pedestrian_open_timeout)
 
     def activate_relay(self, _: Any = None) -> None:
         """
         Activate the relay to move the door and set the last action time.
         """
         self.log("Activating relay", level="DEBUG")
-        self.turn_on(self.door_switch)
+        self.turn_on(self.door_relay)
         self.run_in(self.turn_off_switch, RELAY_TOGGLE_TIMEOUT)
         self.last_action_time = datetime.datetime.now()
 
-        if self.has_sensors and self.last_command_by_app:
+        if self.has_sensors and self.pending_target:
             self.schedule_diagnostics()
 
     def turn_off_switch(self, _: Any) -> None:
@@ -237,33 +208,21 @@ class DoorController(hass.Hass):
         Turn off the door switch after activating the relay.
         """
         self.log("Turning off door switch")
-        self.turn_off(self.door_switch)
+        self.turn_off(self.door_relay)
 
     def request_target_state(self, target_state: str) -> None:
         """
-        Request an explicit open/close action.
-
-        If the controller predicts the next relay pulse already matches the target
-        direction, a single pulse is enough. Otherwise it uses the existing
-        three-pulse fallback to reverse direction.
+        Request an explicit open/close action with a single relay pulse.
         """
-        self.last_command_by_app = True
-        self.target_state = target_state
-
-        if self.isSensorless:
-            self.activate_relay()
-            self.last_command_by_app = False
-            self.target_state = None
+        if self.has_sensors and self.door_state == target_state:
+            action = "open" if target_state == "open" else "close"
+            self.log(
+                f"Ignoring '{action}' request because the door is already {target_state}."
+            )
             return
 
-        if self.predict_mov_dir == target_state:
-            self.activate_relay()
-        else:
-            self.activate_relay()
-            self.run_in(self.activate_relay, 1)
-            self.run_in(self.activate_relay, 2)
-
-        self.predict_mov_dir = "close" if target_state == "open" else "open"
+        self.pending_target = target_state if self.has_sensors else None
+        self.activate_relay()
 
     def door_status_changed(
         self, entity: Any, attribute: Any, old: Any, new: Any, kwargs: Any
@@ -280,7 +239,17 @@ class DoorController(hass.Hass):
         if self.isSensorless:
             return
 
-        self.set_door_state(self.evaluate_door_state())
+        target_state = self.pending_target
+        state = self.evaluate_door_state()
+
+        if target_state and self.movement_timed_out() and state == "faulty":
+            self.log(
+                f"Fault detected: Door did not reach '{target_state}' "
+                f"within {self.timeout} seconds.",
+                level="WARNING",
+            )
+
+        self.set_door_state(state)
 
     def run_diagnostics(self, kwargs: Any) -> None:
         """
@@ -293,21 +262,7 @@ class DoorController(hass.Hass):
         if self.isSensorless:
             return
 
-        state = self.evaluate_door_state()
-        if (
-            self.last_command_by_app
-            and self.target_state
-            and self.movement_timed_out()
-            and state != self.target_state
-        ):
-            self.log(
-                f"Fault detected: Door did not reach '{self.target_state}' "
-                f"within {self.timeout} seconds.",
-                level="WARNING",
-            )
-            state = "faulty"
-
-        self.set_door_state(state)
+        self.set_door_state(self.evaluate_door_state())
 
     def evaluate_door_state(self) -> str:
         """
@@ -329,6 +284,8 @@ class DoorController(hass.Hass):
                 return "closed"
             if open_active:
                 return "open"
+            if self.pending_target and self.movement_timed_out():
+                return "faulty"
             return "intermediate"
 
         if self.close_sensor:
@@ -336,6 +293,10 @@ class DoorController(hass.Hass):
                 return "unknown"
             if close_active:
                 return "closed"
+            if self.pending_target == "open" and self.movement_timed_out():
+                return "open"
+            if self.pending_target == "closed" and self.movement_timed_out():
+                return "faulty"
             if self.command_in_progress():
                 return "intermediate"
             return "open"
@@ -345,6 +306,10 @@ class DoorController(hass.Hass):
                 return "unknown"
             if open_active:
                 return "open"
+            if self.pending_target == "closed" and self.movement_timed_out():
+                return "closed"
+            if self.pending_target == "open" and self.movement_timed_out():
+                return "faulty"
             if self.command_in_progress():
                 return "intermediate"
             return "closed"
@@ -353,7 +318,7 @@ class DoorController(hass.Hass):
 
     def set_door_state(self, state: str) -> None:
         """
-        Persist the door state and keep movement prediction in sync.
+        Persist the door state.
         """
         previous_state = self.door_state
         self.door_state = state
@@ -362,20 +327,12 @@ class DoorController(hass.Hass):
         if state != previous_state:
             self.log(f"Door state changed: {previous_state} -> {state}")
 
-        if state == "closed":
-            self.predict_mov_dir = "open"
-            self.last_command_by_app = False
-            self.target_state = None
-            self.cancel_diagnostics()
-        elif state == "open":
-            self.predict_mov_dir = "close"
-            self.last_command_by_app = False
-            self.target_state = None
-            self.cancel_diagnostics()
-        elif state == "faulty":
-            self.last_command_by_app = False
-            self.target_state = None
-            self.cancel_diagnostics()
+        if state in {"closed", "open"}:
+            self.clear_pending_command()
+        elif state == "faulty" and (
+            self.pending_target is None or self.movement_timed_out()
+        ):
+            self.clear_pending_command()
 
     def get_sensor_active_state(
         self, sensor_entity: Optional[str], active_state: str
@@ -417,7 +374,14 @@ class DoorController(hass.Hass):
         """
         Return True while an app-issued movement is still within its timeout window.
         """
-        return self.last_command_by_app and not self.movement_timed_out()
+        return self.pending_target is not None and not self.movement_timed_out()
+
+    def clear_pending_command(self) -> None:
+        """
+        Clear the active command and any pending diagnostics.
+        """
+        self.pending_target = None
+        self.cancel_diagnostics()
 
     def movement_timed_out(self) -> bool:
         """
@@ -436,12 +400,15 @@ class DoorController(hass.Hass):
         """
         return str(state).strip().lower()
 
-    def _should_ignore_event(self, old: Any, new: Any) -> bool:
+    def _slugify(self, value: Any) -> str:
         """
-        Ignore startup noise and non-changes from helper entities.
+        Convert a label into a stable entity-id suffix.
         """
-        normalized_new = self._normalize_state(new)
-        if normalized_new in {"unknown", "unavailable", "none"}:
-            return True
+        slug = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+        return slug or "door_controller"
 
-        return old == new
+    def _build_generated_entity_id(self, domain: str, suffix: str) -> str:
+        """
+        Build an app-managed entity id from the configured prefix.
+        """
+        return f"{domain}.{self.entity_prefix}_{suffix}"
