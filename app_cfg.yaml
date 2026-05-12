@@ -1,88 +1,114 @@
-### DOOR CONTROLLERS START
-# Detailed Help for Creating Configuration:
-# 1. Module and Class (Required):
-#    - module: The name of the Python module file (without .py extension) where the DoorController class is defined.
-#    - class: The name of the class to instantiate, which should be DoorController in this case.
+### STEROWNIKI DRZWI I BRAM - START
+# Szczegółowa pomoc do tworzenia konfiguracji:
+# 1. Moduł i klasa (wymagane):
+#    - module: Nazwa pliku modułu Pythona bez rozszerzenia .py, w którym znajduje się klasa DoorController.
+#    - class: Nazwa klasy do uruchomienia. W tej aplikacji powinna to być DoorController.
 #
-# 2. Logging Level (Optional):
-#    - log_level: Sets the verbosity of the logs. Use DEBUG for detailed logging during development and troubleshooting.
+# 2. Poziom logowania (opcjonalny):
+#    - log_level: Ustawia szczegółowość logów. Użyj DEBUG podczas testowania i diagnozowania problemów.
 #
-# 3. Physical Inputs:
-#    - close_sensor (Optional): Entity ID of the binary sensor that indicates when the door is fully closed.
-#    - close_sensor_active_state (Optional): Raw state treated as "closed reached" for close_sensor. Defaults to "off" for backward compatibility.
-#    - open_sensor (Optional): Entity ID of the binary sensor that indicates when the door is fully open.
-#    - open_sensor_active_state (Optional): Raw state treated as "open reached" for open_sensor. Defaults to "off" for backward compatibility.
+# 3. MQTT Discovery:
+#    - mqtt_namespace: Namespace MQTT w AppDaemon. Domyślnie "mqtt".
+#    - mqtt_discovery_prefix: Prefix discovery Home Assistant. Domyślnie "homeassistant".
+#    - mqtt_base_topic: Bazowy topic sterownika. Domyślnie "door_controller/<entity_prefix>".
+#    - cover_entity_id: Docelowe entity_id encji cover tworzonej przez MQTT Discovery.
+#    - cover_device_class: Klasa cover w Home Assistant, np. "garage" albo "gate".
 #
-# 4. Physical Outputs:
-#    - door_relay (Required): Entity ID of the switch that controls the door or gate motor (usually a relay).
+# 4. Wejścia fizyczne:
+#    - close_sensor (opcjonalny): Entity ID czujnika binarnego informującego, że drzwi/brama są całkowicie zamknięte.
+#    - close_sensor_active_state (opcjonalny): Surowy stan oznaczający osiągnięcie pozycji zamkniętej dla close_sensor. Domyślnie "off" dla zgodności wstecznej.
+#    - open_sensor (opcjonalny): Entity ID czujnika binarnego informującego, że drzwi/brama są całkowicie otwarte.
+#    - open_sensor_active_state (opcjonalny): Surowy stan oznaczający osiągnięcie pozycji otwartej dla open_sensor. Domyślnie "off" dla zgodności wstecznej.
 #
-# 5. Calibration (Optional):
-#    - timeout: Time in seconds to wait for door operation to complete before considering it a fault. Adjust this based on your door or gate's typical operation time.
+# 5. Wyjścia fizyczne:
+#    - door_relay (wymagany): Entity ID przełącznika sterującego napędem drzwi/bramy, zwykle przekaźnika.
 #
-# 6. App Generated Entities:
-#    - input_button.<friendly_name_slug>_open
-#    - input_button.<friendly_name_slug>_close
-#    - input_button.<friendly_name_slug>_external
-#    - sensor.<friendly_name_slug>_status
-#    - sensor.<friendly_name_slug>_health
+# 6. Kalibracja (opcjonalna):
+#    - timeout: Czas w sekundach oczekiwania na zakończenie ruchu przed uznaniem go za błąd. Dopasuj go do typowego czasu pracy napędu.
 #
-# 7. Friendly Name (Optional):
-#    - friendly_name: Used for display names and generated entity IDs.
+# 7. Encje tworzone przez MQTT Discovery:
+#    - button.<entity_prefix>_open
+#    - button.<entity_prefix>_close
+#    - button.<entity_prefix>_external
+#    - cover wskazany przez cover_entity_id albo cover.<entity_prefix>
+#    - sensor.<entity_prefix>_status
+#    - sensor.<entity_prefix>_health
 #
-# Example Usage:
-# - For a garage door with physical contact sensors, you can configure both close_sensor and open_sensor.
-# - For a single-sensor setup, configure only close_sensor and set close_sensor_active_state: "on" when the sensor is true/on while the door is closed.
-# - For a gate without physical sensors, you can omit the sensor configurations and just use a relay.
-# - The app creates its own open/close/external command entities plus status and health sensors during initialization.
+# 8. Nazwa widoczna i prefiks encji (opcjonalne):
+#    - friendly_name: Polska nazwa wyświetlana w interfejsie Home Assistant.
+#    - entity_prefix: Stabilny prefiks technicznych identyfikatorów encji. Ustaw go jawnie, jeśli friendly_name zawiera polskie znaki albo jeśli chcesz zachować istniejące entity_id.
+#
+# Przykłady użycia:
+# - Dla bramy garażowej z czujnikami krańcowymi skonfiguruj close_sensor i open_sensor.
+# - Dla instalacji z jednym czujnikiem skonfiguruj tylko close_sensor i ustaw close_sensor_active_state: "on", jeśli czujnik ma stan true/on przy zamkniętej bramie.
+# - Dla bramy bez czujników fizycznych pomiń konfigurację czujników. Cover MQTT będzie wtedy działał optymistycznie.
+# - Aplikacja tworzy przez MQTT Discovery encje poleceń otwórz/zamknij/przycisk zewnętrzny, cover oraz sensory statusu i stanu aplikacji.
 
-# Garage Door Controller Configuration
+# Konfiguracja sterownika bramy garażowej
 GarageDoorController:
-  module: DoorController # Specifies the module where the DoorController class is located
-  class: DoorController # Specifies the class to be instantiated
-  log_level: INFO # Sets the logging level for this app
-  friendly_name: "Garage Door" # A friendly name for the whole app to be used in Home Assistant UI
+  module: DoorController # Moduł, w którym znajduje się klasa DoorController
+  class: DoorController # Klasa uruchamiana przez AppDaemon
+  log_level: INFO # Poziom logowania tej aplikacji
+  friendly_name: "Brama garażowa" # Nazwa widoczna w interfejsie Home Assistant
+  entity_prefix: "garage_door" # Stabilny prefiks tworzonych entity_id
 
-  # Physical Inputs
-  close_sensor: binary_sensor.garage_gatedoorlow_contact_contact # Physical contact sensor for closed position (Optional)
-  # close_sensor_active_state: "on" # Uncomment when the closed-position sensor is true/on while the door is closed
-  open_sensor: binary_sensor.garage_gatedoorhigh_contact_contact # Physical contact sensor for open position (Optional)
-  # open_sensor_active_state: "on" # Uncomment when the open-position sensor is true/on while the door is open
+  # MQTT Discovery
+  mqtt_namespace: mqtt # Namespace MQTT w AppDaemon
+  mqtt_discovery_prefix: homeassistant # Prefix MQTT Discovery w Home Assistant
+  mqtt_base_topic: door_controller/garage_door # Bazowy topic tego sterownika
+  cover_entity_id: cover.brama_garazowa # Encja cover tworzona przez MQTT Discovery
+  cover_device_class: garage # Klasa encji cover
 
-  # Physical Outputs
-  door_relay: switch.sonoff_basic_relay # Physical relay to control the door motor (Required)
+  # Wejścia fizyczne
+  close_sensor: binary_sensor.garage_gatedoorlow_contact_contact # Czujnik pozycji zamkniętej (opcjonalny)
+  # close_sensor_active_state: "on" # Odkomentuj, jeśli czujnik pozycji zamkniętej ma stan true/on przy zamkniętej bramie
+  open_sensor: binary_sensor.garage_gatedoorhigh_contact_contact # Czujnik pozycji otwartej (opcjonalny)
+  # open_sensor_active_state: "on" # Odkomentuj, jeśli czujnik pozycji otwartej ma stan true/on przy otwartej bramie
 
-  # Calibration
-  timeout: 20 # Timeout in seconds for door operation, used for diagnostics (Optional)
+  # Wyjścia fizyczne
+  door_relay: switch.sonoff_basic_relay # Przekaźnik sterujący napędem bramy (wymagany)
 
-  # App will create:
-  # input_button.garage_door_open
-  # input_button.garage_door_close
-  # input_button.garage_door_external
+  # Kalibracja
+  timeout: 20 # Limit czasu ruchu w sekundach, używany do diagnostyki (opcjonalny)
+
+  # Aplikacja utworzy przez MQTT Discovery:
+  # button.garage_door_open
+  # button.garage_door_close
+  # button.garage_door_external
+  # cover.brama_garazowa
   # sensor.garage_door_status
   # sensor.garage_door_health
 
-# External Gate Controller Configuration
+# Konfiguracja sterownika bramy zewnętrznej
 ExternalGateController:
-  module: DoorController # Specifies the module where the DoorController class is located
-  class: DoorController # Specifies the class to be instantiated
-  log_level: DEBUG # Sets the logging level for this app
-  friendly_name: "External Gate" # A friendly name for the whole app to be used in Home Assistant UI
+  module: DoorController # Moduł, w którym znajduje się klasa DoorController
+  class: DoorController # Klasa uruchamiana przez AppDaemon
+  log_level: DEBUG # Poziom logowania tej aplikacji
+  friendly_name: "Brama zewnętrzna" # Nazwa widoczna w interfejsie Home Assistant
+  entity_prefix: "external_gate" # Stabilny prefiks tworzonych entity_id
 
-  # Physical Inputs
-  close_sensor: binary_sensor.frontyard_externalgate_contact_contact # Physical contact sensor for closed position (Optional)
+  # MQTT Discovery
+  mqtt_namespace: mqtt # Namespace MQTT w AppDaemon
+  mqtt_discovery_prefix: homeassistant # Prefix MQTT Discovery w Home Assistant
+  mqtt_base_topic: door_controller/external_gate # Bazowy topic tego sterownika
+  cover_entity_id: cover.gate # Encja cover tworzona przez MQTT Discovery
+  cover_device_class: gate # Klasa encji cover
 
-  # Physical Outputs
-  door_relay: switch.garage_gate_relay # Physical relay to control the gate motor (Required)
+  # Wejścia fizyczne
+  close_sensor: binary_sensor.frontyard_externalgate_contact_contact # Czujnik pozycji zamkniętej (opcjonalny)
 
-  # Calibration
-  timeout: 30 # Timeout in seconds for gate operation, used for diagnostics (Optional)
+  # Wyjścia fizyczne
+  door_relay: switch.garage_gate_relay # Przekaźnik sterujący napędem bramy (wymagany)
 
-  # App will create:
-  # input_button.external_gate_open
-  # input_button.external_gate_close
-  # input_button.external_gate_external
+  # Kalibracja
+  timeout: 30 # Limit czasu ruchu w sekundach, używany do diagnostyki (opcjonalny)
+
+  # Aplikacja utworzy przez MQTT Discovery:
+  # button.external_gate_open
+  # button.external_gate_close
+  # button.external_gate_external
+  # cover.gate
   # sensor.external_gate_status
   # sensor.external_gate_health
 
-
-### DOOR CONTROLLERS END
+### STEROWNIKI DRZWI I BRAM - KONIEC

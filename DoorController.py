@@ -1,54 +1,106 @@
 import datetime
+import json
 import re
+import unicodedata
 from typing import Any, Optional
 
 import appdaemon.plugins.hass.hassapi as hass
 
 # Constants for relay toggle timeout
 RELAY_TOGGLE_TIMEOUT = 0.5
+POLISH_CHAR_REPLACEMENTS = {
+    "ą": "a",
+    "ć": "c",
+    "ę": "e",
+    "ł": "l",
+    "ń": "n",
+    "ó": "o",
+    "ś": "s",
+    "ź": "z",
+    "ż": "z",
+    "Ą": "a",
+    "Ć": "c",
+    "Ę": "e",
+    "Ł": "l",
+    "Ń": "n",
+    "Ó": "o",
+    "Ś": "s",
+    "Ź": "z",
+    "Ż": "z",
+    "Ä…": "a",
+    "Ä‡": "c",
+    "Ä™": "e",
+    "Ĺ‚": "l",
+    "Ĺ„": "n",
+    "Ăł": "o",
+    "Ĺ›": "s",
+    "Ĺş": "z",
+    "ĹĽ": "z",
+    "Ä„": "a",
+    "Ä†": "c",
+    "Ä": "e",
+    "Ĺ": "l",
+    "Ĺ": "n",
+    "Ă“": "o",
+    "Ĺš": "s",
+    "Ĺą": "z",
+    "Ĺ»": "z",
+}
 
 
 class DoorController(hass.Hass):
     """
     DoorController is an AppDaemon app that manages the state of a door using sensors and a switch.
     It listens for state changes in door sensors, controls a relay to open or close the door,
-    and updates Home Assistant entities to reflect the door status and app health.
+    and publishes Home Assistant entities through MQTT Discovery.
     """
 
     def initialize(self) -> None:
         """
         Initialize the DoorController app.
         - Load configuration parameters.
-        - Set initial state.
-        - Register state listeners and services.
-        - Create and initialize door status and health entities.
+        - Register state listeners and MQTT command listeners.
+        - Publish MQTT Discovery for command buttons, cover, status sensor, and health sensor.
         """
         self.log("Initializing Door Controller App")
-        self.friendly_name = self.args.get("friendly_name", "Door Controller")
-        self.entity_prefix = self._slugify(self.args.get("entity_prefix", self.friendly_name))
-        self.input_button_open = self._build_generated_entity_id("input_button", "open")
-        self.input_button_close = self._build_generated_entity_id("input_button", "close")
-        self.input_button_external = self._build_generated_entity_id(
-            "input_button", "external"
+        configured_friendly_name = self.args.get("friendly_name")
+        self.friendly_name = configured_friendly_name or "Sterownik drzwi"
+        default_entity_prefix = configured_friendly_name or "door_controller"
+        self.entity_prefix = self._slugify(
+            self.args.get("entity_prefix", default_entity_prefix)
+        )
+
+        self.button_open_entity = self._build_generated_entity_id("button", "open")
+        self.button_close_entity = self._build_generated_entity_id("button", "close")
+        self.button_external_entity = self._build_generated_entity_id(
+            "button", "external"
+        )
+        self.cover_entity = self.args.get(
+            "cover_entity_id", f"cover.{self.entity_prefix}"
         )
         self.door_status_sensor = self._build_generated_entity_id("sensor", "status")
         self.health_status_sensor = self._build_generated_entity_id("sensor", "health")
 
-        required_args = (
-            "door_relay",
+        self.cover_device_class = self.args.get("cover_device_class", "garage")
+        self.mqtt_namespace = self.args.get("mqtt_namespace", "mqtt")
+        self.mqtt_discovery_prefix = self._normalize_topic(
+            self.args.get("mqtt_discovery_prefix", "homeassistant")
         )
-        missing_args = [key for key in required_args if key not in self.args]
-        if missing_args:
-            self.log(
-                f"Configuration error: missing required keys: {', '.join(missing_args)}",
-                level="ERROR",
-            )
-            if self.health_status_sensor:
-                self.create_health_entity()
-                self.update_health_entity("faulty")
-            return
-
-        self.door_relay = self.args["door_relay"]
+        self.mqtt_base_topic = self._normalize_topic(
+            self.args.get("mqtt_base_topic", f"door_controller/{self.entity_prefix}")
+        )
+        self.availability_topic = f"{self.mqtt_base_topic}/availability"
+        self.status_state_topic = f"{self.mqtt_base_topic}/status/state"
+        self.health_state_topic = f"{self.mqtt_base_topic}/health/state"
+        self.cover_state_topic = f"{self.mqtt_base_topic}/cover/state"
+        self.cover_command_topic = f"{self.mqtt_base_topic}/cover/command"
+        self.button_open_command_topic = f"{self.mqtt_base_topic}/button/open/command"
+        self.button_close_command_topic = (
+            f"{self.mqtt_base_topic}/button/close/command"
+        )
+        self.button_external_command_topic = (
+            f"{self.mqtt_base_topic}/button/external/command"
+        )
 
         self.close_sensor = self.args.get("close_sensor")
         self.open_sensor = self.args.get("open_sensor")
@@ -67,14 +119,24 @@ class DoorController(hass.Hass):
         self.pending_target: Optional[str] = None
         self.diagnostic_handle: Optional[str] = None
 
+        required_args = ("door_relay",)
+        missing_args = [key for key in required_args if key not in self.args]
+        if missing_args:
+            self.log(
+                f"Configuration error: missing required keys: {', '.join(missing_args)}",
+                level="ERROR",
+            )
+            self.publish_mqtt_discovery(include_commands=False)
+            self.create_health_entity()
+            self.update_health_entity("faulty")
+            return
+
+        self.door_relay = self.args["door_relay"]
+
         if self.close_sensor:
             self.listen_state(self.door_status_changed, self.close_sensor)
         if self.open_sensor:
             self.listen_state(self.door_status_changed, self.open_sensor)
-
-        self.listen_state(self.handle_open_event, self.input_button_open)
-        self.listen_state(self.handle_close_event, self.input_button_close)
-        self.listen_state(self.handle_external_button_event, self.input_button_external)
 
         self.create_command_entities()
         self.create_door_status_entity()
@@ -88,23 +150,10 @@ class DoorController(hass.Hass):
 
     def create_command_entities(self) -> None:
         """
-        Create app-managed command helper entities.
+        Publish MQTT Discovery and subscribe to command topics.
         """
-        self.set_state(
-            self.input_button_open,
-            state="idle",
-            attributes={"friendly_name": f"{self.friendly_name} Open"},
-        )
-        self.set_state(
-            self.input_button_close,
-            state="idle",
-            attributes={"friendly_name": f"{self.friendly_name} Close"},
-        )
-        self.set_state(
-            self.input_button_external,
-            state="idle",
-            attributes={"friendly_name": f"{self.friendly_name} External"},
-        )
+        self.publish_mqtt_discovery()
+        self.subscribe_mqtt_commands()
 
     def create_door_status_entity(self) -> None:
         """
@@ -118,11 +167,12 @@ class DoorController(hass.Hass):
 
         :param state: The new state of the door status.
         """
-        self.set_state(
-            self.door_status_sensor,
-            state=state,
-            attributes={"friendly_name": f"{self.friendly_name} Status"},
-        )
+        self.publish_mqtt_state(self.status_state_topic, state)
+
+        if self.has_sensors:
+            self.publish_mqtt_state(
+                self.cover_state_topic, self._door_state_to_cover_state(state)
+            )
 
     def create_health_entity(self) -> None:
         """
@@ -132,46 +182,42 @@ class DoorController(hass.Hass):
 
     def update_health_entity(self, state: str) -> None:
         """
-        Update the state of the app health entity.
+        Update the state of the app health.
 
         :param state: The new state of the app health.
         """
-        self.set_state(
-            self.health_status_sensor,
-            state=state,
-            attributes={"friendly_name": f"{self.friendly_name} Health"},
-        )
+        self.publish_mqtt_state(self.health_state_topic, state)
 
     def handle_open_event(
         self, entity: str, attribute: str, old: str, new: str, kwargs: dict
     ) -> None:
         """
-        Handle the input_button to open the door.
+        Handle the command button to open the door.
 
-        :param entity: The input_button entity that changed state.
+        :param entity: The button or cover entity that sent the command.
         :param attribute: The attribute of the entity that changed.
         :param old: The old state of the entity.
-        :param new: The new state of the entity.
+        :param new: The new command payload.
         :param kwargs: Additional keyword arguments.
         """
 
-        self.log("Opening door (input_button)...")
+        self.log("Opening door (command button)...")
         self.request_target_state("open")
 
     def handle_close_event(
         self, entity: str, attribute: str, old: str, new: str, kwargs: dict
     ) -> None:
         """
-        Handle the input_button to close the door.
+        Handle the command button to close the door.
 
-        :param entity: The input_button entity that changed state.
+        :param entity: The button or cover entity that sent the command.
         :param attribute: The attribute of the entity that changed.
         :param old: The old state of the entity.
-        :param new: The new state of the entity.
+        :param new: The new command payload.
         :param kwargs: Additional keyword arguments.
         """
 
-        self.log("Closing door (input_button)...")
+        self.log("Closing door (command button)...")
         self.request_target_state("closed")
 
     def handle_external_button_event(
@@ -190,6 +236,46 @@ class DoorController(hass.Hass):
         self.log("External button activated, pulsing relay.")
         self.clear_pending_command()
         self.activate_relay()
+
+    def handle_mqtt_command_event(
+        self, event_name: str, data: dict, kwargs: dict
+    ) -> None:
+        """
+        Handle MQTT button and cover commands published by Home Assistant.
+        """
+        topic = self._event_topic(data, kwargs)
+        payload = self._normalize_payload((data or {}).get("payload"))
+
+        if topic == self.cover_command_topic:
+            if payload == "OPEN":
+                self.handle_open_event(self.cover_entity, "command", None, payload, {})
+            elif payload == "CLOSE":
+                self.handle_close_event(self.cover_entity, "command", None, payload, {})
+            elif payload == "STOP":
+                self.handle_external_button_event(
+                    self.cover_entity, "command", None, payload, {}
+                )
+            else:
+                self.log(f"Ignoring unsupported cover MQTT payload: {payload}")
+            return
+
+        if topic == self.button_open_command_topic and payload == "PRESS":
+            self.handle_open_event(self.button_open_entity, "command", None, payload, {})
+            return
+
+        if topic == self.button_close_command_topic and payload == "PRESS":
+            self.handle_close_event(
+                self.button_close_entity, "command", None, payload, {}
+            )
+            return
+
+        if topic == self.button_external_command_topic and payload == "PRESS":
+            self.handle_external_button_event(
+                self.button_external_entity, "command", None, payload, {}
+            )
+            return
+
+        self.log(f"Ignoring unsupported MQTT command: topic={topic}, payload={payload}")
 
     def activate_relay(self, _: Any = None) -> None:
         """
@@ -394,17 +480,252 @@ class DoorController(hass.Hass):
             datetime.datetime.now() - self.last_action_time
         ).total_seconds() >= self.timeout
 
+    def publish_mqtt_discovery(self, include_commands: bool = True) -> None:
+        """
+        Publish retained MQTT Discovery configs for Home Assistant.
+        """
+        configs = {
+            self._discovery_topic("sensor", "status"): self._sensor_payload(
+                self.door_status_sensor,
+                self._build_friendly_name("Status"),
+                "status",
+                self.status_state_topic,
+                "mdi:garage",
+            ),
+            self._discovery_topic("sensor", "health"): self._sensor_payload(
+                self.health_status_sensor,
+                self._build_friendly_name("Stan aplikacji"),
+                "health",
+                self.health_state_topic,
+                "mdi:heart-pulse",
+                entity_category="diagnostic",
+            ),
+        }
+
+        if include_commands:
+            configs.update(
+                {
+                    self._discovery_topic("button", "open"): self._button_payload(
+                        self.button_open_entity,
+                        self._build_friendly_name("Otwórz"),
+                        "open",
+                        self.button_open_command_topic,
+                        "mdi:arrow-up-bold",
+                    ),
+                    self._discovery_topic("button", "close"): self._button_payload(
+                        self.button_close_entity,
+                        self._build_friendly_name("Zamknij"),
+                        "close",
+                        self.button_close_command_topic,
+                        "mdi:arrow-down-bold",
+                    ),
+                    self._discovery_topic(
+                        "button", "external"
+                    ): self._button_payload(
+                        self.button_external_entity,
+                        self._build_friendly_name("Przycisk zewnętrzny"),
+                        "external",
+                        self.button_external_command_topic,
+                        "mdi:gesture-tap-button",
+                    ),
+                    self._discovery_topic("cover", "cover"): self._cover_payload(),
+                }
+            )
+
+        for topic, payload in configs.items():
+            self.publish_mqtt_payload(topic, payload, retain=True)
+
+        self.publish_mqtt_state(self.availability_topic, "online")
+
+    def subscribe_mqtt_commands(self) -> None:
+        """
+        Subscribe AppDaemon's MQTT plugin to Home Assistant command topics.
+        """
+        command_topics = (
+            self.cover_command_topic,
+            self.button_open_command_topic,
+            self.button_close_command_topic,
+            self.button_external_command_topic,
+        )
+
+        for topic in command_topics:
+            try:
+                self.call_service(
+                    "mqtt/subscribe", topic=topic, namespace=self.mqtt_namespace
+                )
+            except Exception as error:
+                self.log(
+                    f"MQTT subscribe failed for {topic}: {error}", level="ERROR"
+                )
+
+            self.listen_event(
+                self.handle_mqtt_command_event,
+                "MQTT_MESSAGE",
+                topic=topic,
+                namespace=self.mqtt_namespace,
+            )
+
+    def publish_mqtt_state(self, topic: str, state: str) -> None:
+        """
+        Publish a retained MQTT state payload.
+        """
+        self.publish_mqtt_payload(topic, state, retain=True)
+
+    def publish_mqtt_payload(self, topic: str, payload: Any, retain: bool) -> None:
+        """
+        Publish an MQTT payload through the AppDaemon MQTT plugin.
+        """
+        if isinstance(payload, (dict, list)):
+            payload = json.dumps(payload, ensure_ascii=False)
+
+        try:
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=payload,
+                retain=retain,
+                namespace=self.mqtt_namespace,
+            )
+        except Exception as error:
+            self.log(f"MQTT publish failed for {topic}: {error}", level="ERROR")
+
+    def _base_discovery_payload(
+        self, entity_id: str, name: str, unique_suffix: str
+    ) -> dict:
+        return {
+            "name": name,
+            "unique_id": f"door_controller_{self.entity_prefix}_{unique_suffix}",
+            "default_entity_id": entity_id,
+            "availability_topic": self.availability_topic,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "device": self._mqtt_device(),
+            "origin": self._mqtt_origin(),
+        }
+
+    def _sensor_payload(
+        self,
+        entity_id: str,
+        name: str,
+        unique_suffix: str,
+        state_topic: str,
+        icon: str,
+        entity_category: Optional[str] = None,
+    ) -> dict:
+        payload = self._base_discovery_payload(entity_id, name, unique_suffix)
+        payload.update({"state_topic": state_topic, "icon": icon})
+
+        if entity_category:
+            payload["entity_category"] = entity_category
+
+        return payload
+
+    def _button_payload(
+        self,
+        entity_id: str,
+        name: str,
+        unique_suffix: str,
+        command_topic: str,
+        icon: str,
+    ) -> dict:
+        payload = self._base_discovery_payload(entity_id, name, unique_suffix)
+        payload.update(
+            {
+                "command_topic": command_topic,
+                "payload_press": "PRESS",
+                "retain": False,
+                "icon": icon,
+            }
+        )
+        return payload
+
+    def _cover_payload(self) -> dict:
+        payload = self._base_discovery_payload(
+            self.cover_entity, self.friendly_name, "cover"
+        )
+        payload.update(
+            {
+                "command_topic": self.cover_command_topic,
+                "payload_open": "OPEN",
+                "payload_close": "CLOSE",
+                "payload_stop": None,
+                "device_class": self.cover_device_class,
+                "retain": False,
+                "optimistic": not self.has_sensors,
+            }
+        )
+
+        if self.has_sensors:
+            payload.update(
+                {
+                    "state_topic": self.cover_state_topic,
+                    "state_open": "open",
+                    "state_opening": "opening",
+                    "state_closed": "closed",
+                    "state_closing": "closing",
+                    "state_stopped": "stopped",
+                }
+            )
+
+        return payload
+
+    def _mqtt_device(self) -> dict:
+        return {
+            "identifiers": [f"door_controller_{self.entity_prefix}"],
+            "name": self.friendly_name,
+            "manufacturer": "AppDaemon",
+            "model": "DoorController",
+        }
+
+    def _mqtt_origin(self) -> dict:
+        return {"name": "DoorController AppDaemon"}
+
+    def _door_state_to_cover_state(self, state: str) -> str:
+        if state in {"open", "closed"}:
+            return state
+
+        if state == "intermediate":
+            if self.pending_target == "open":
+                return "opening"
+            if self.pending_target == "closed":
+                return "closing"
+            return "stopped"
+
+        return "None"
+
+    def _event_topic(self, data: Optional[dict], kwargs: Optional[dict]) -> Any:
+        if data and "topic" in data:
+            return data["topic"]
+        if kwargs and "topic" in kwargs:
+            return kwargs["topic"]
+        return None
+
+    def _normalize_payload(self, payload: Any) -> str:
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8", errors="ignore")
+        return str(payload or "").strip().upper()
+
     def _normalize_state(self, state: Any) -> str:
         """
         Normalize Home Assistant/AppDaemon state values for comparisons.
         """
         return str(state).strip().lower()
 
+    def _normalize_topic(self, topic: Any) -> str:
+        normalized_topic = str(topic).strip().strip("/")
+        return normalized_topic or "door_controller"
+
     def _slugify(self, value: Any) -> str:
         """
         Convert a label into a stable entity-id suffix.
         """
-        slug = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+        replaced_value = str(value)
+        for source, replacement in POLISH_CHAR_REPLACEMENTS.items():
+            replaced_value = replaced_value.replace(source, replacement)
+
+        normalized_value = unicodedata.normalize("NFKD", replaced_value)
+        ascii_value = normalized_value.encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^a-z0-9]+", "_", ascii_value.strip().lower()).strip("_")
         return slug or "door_controller"
 
     def _build_generated_entity_id(self, domain: str, suffix: str) -> str:
@@ -412,3 +733,13 @@ class DoorController(hass.Hass):
         Build an app-managed entity id from the configured prefix.
         """
         return f"{domain}.{self.entity_prefix}_{suffix}"
+
+    def _build_friendly_name(self, suffix: str) -> str:
+        """
+        Build a localized display name for an app-managed entity.
+        """
+        return f"{self.friendly_name}: {suffix}"
+
+    def _discovery_topic(self, component: str, object_id: str) -> str:
+        discovery_object_id = self._slugify(f"{self.entity_prefix}_{object_id}")
+        return f"{self.mqtt_discovery_prefix}/{component}/{discovery_object_id}/config"

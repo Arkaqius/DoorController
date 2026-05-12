@@ -11,6 +11,8 @@ class FakeHass:
         self.args = {}
         self.state_store = {}
         self.listeners = []
+        self.event_listeners = []
+        self.service_calls = []
         self.turn_on_calls = []
         self.turn_off_calls = []
         self.run_in_calls = []
@@ -34,6 +36,16 @@ class FakeHass:
 
     def listen_state(self, callback, entity):
         self.listeners.append({"callback": callback, "entity": entity})
+
+    def listen_event(self, callback, event=None, **kwargs):
+        handle = f"event_{len(self.event_listeners) + 1}"
+        self.event_listeners.append(
+            {"callback": callback, "event": event, "kwargs": kwargs, "handle": handle}
+        )
+        return handle
+
+    def call_service(self, service, **kwargs):
+        self.service_calls.append({"service": service, "kwargs": kwargs})
 
     def turn_on(self, entity):
         self.turn_on_calls.append(entity)
